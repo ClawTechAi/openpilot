@@ -40,8 +40,8 @@ async def control_body(data, app):
   x = max(-1.0, min(1.0, data['x']))
   y = max(-1.0, min(1.0, data['y']))
   dat = messaging.new_message()
-  dat.bodyReserved0 = json.dumps({'x': x, 'y': y})
-  pm.send('bodyReserved0', dat)
+  dat.customReservedRawData0 = json.dumps({'x': x, 'y': y}).encode()
+  pm.send('customReservedRawData0', dat)
   if (data['type'] == 'control_command'):
     app['mutable_vals']['prev_command'] = [data['x'], data['y']]
 
@@ -141,7 +141,6 @@ async def run(cmd):
     stderr=asyncio.subprocess.PIPE
   )
   stdout, stderr = await proc.communicate()
-  logger.info("Created key and cert!")
   if stdout:
     logger.info(f'[stdout]\n{stdout.decode()}')
   if stderr:
@@ -150,7 +149,7 @@ async def run(cmd):
 
 def main():
   global pm, sm
-  pm = messaging.PubMaster(['bodyReserved0'])
+  pm = messaging.PubMaster(['customReservedRawData0'])
   sm = messaging.SubMaster(['carState', 'logMessage'])
   # App needs to be HTTPS for microphone and audio autoplay to work on the browser
   cert_path = TELEOPDIR + '/cert.pem'
@@ -158,8 +157,14 @@ def main():
   if (not os.path.exists(cert_path)) or (not os.path.exists(key_path)):
     asyncio.run(run(f'openssl req -x509 -newkey rsa:4096 -nodes -out {cert_path} -keyout {key_path} \
                      -days 365 -subj "/C=US/ST=California/O=commaai/OU=comma body"'))
+    logger.info("Created key and cert!")
   else:
     logger.info("Certificate exists!")
+
+  # Increase device volume to 100%
+  # ToDo: Do this properly
+  asyncio.run(run('pactl set-sink-volume @DEFAULT_SINK@ 80%'))
+
   ssl_context = ssl.SSLContext()
   ssl_context.load_cert_chain(cert_path, key_path)
   app = web.Application()
