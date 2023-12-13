@@ -14,6 +14,7 @@ from openpilot.selfdrive.car.honda.values import CruiseButtons
 from openpilot.tools.sim.lib.common import SimulatorState, World
 from openpilot.tools.sim.lib.simulated_car import SimulatedCar
 from openpilot.tools.sim.lib.simulated_sensors import SimulatedSensors
+from openpilot.tools.sim.lib.keyboard_ctrl import KEYBOARD_HELP
 
 
 def rk_loop(function, hz, exit_event: threading.Event):
@@ -45,6 +46,8 @@ class SimulatorBridge(ABC):
 
     self.world: Optional[World] = None
 
+    self.past_startup_engaged = False
+
   def _on_shutdown(self, signal, frame):
     self.shutdown()
 
@@ -65,9 +68,19 @@ class SimulatorBridge(ABC):
       self.world.close()
 
   def run(self, queue, retries=-1):
-    bridge_p = Process(target=self.bridge_keep_alive, args=(queue, retries), daemon=True)
+    bridge_p = Process(name="bridge", target=self.bridge_keep_alive, args=(queue, retries))
     bridge_p.start()
     return bridge_p
+
+  def print_status(self):
+    print(
+    f"""
+Keyboard Commands:
+{KEYBOARD_HELP}
+
+State:
+Ignition: {self.simulator_state.ignition} Engaged: {self.simulator_state.is_engaged}
+    """)
 
   @abstractmethod
   def spawn_world(self) -> World:
@@ -83,6 +96,10 @@ class SimulatorBridge(ABC):
                                                                         100, self._exit_event))
     self.simulated_car_thread.start()
 
+    self.simulated_camera_thread = threading.Thread(target=rk_loop, args=(functools.partial(self.simulated_sensors.send_camera_images, self.world),
+                                                                        20, self._exit_event))
+    self.simulated_camera_thread.start()
+
     # Simulation tends to be slow in the initial steps. This prevents lagging later
     for _ in range(20):
       self.world.tick()
@@ -92,6 +109,8 @@ class SimulatorBridge(ABC):
       throttle_op = steer_op = brake_op = 0.0
 
       self.simulator_state.cruise_button = 0
+      self.simulator_state.left_blinker = False
+      self.simulator_state.right_blinker = False
 
       throttle_manual = steer_manual = brake_manual = 0.
 
@@ -114,6 +133,11 @@ class SimulatorBridge(ABC):
             self.simulator_state.cruise_button = CruiseButtons.CANCEL
           elif m[1] == "main":
             self.simulator_state.cruise_button = CruiseButtons.MAIN
+        elif m[0] == "blinker":
+          if m[1] == "left":
+            self.simulator_state.left_blinker = True
+          elif m[1] == "right":
+            self.simulator_state.right_blinker = True
         elif m[0] == "ignition":
           self.simulator_state.ignition = not self.simulator_state.ignition
         elif m[0] == "reset":
@@ -123,24 +147,29 @@ class SimulatorBridge(ABC):
 
       self.simulator_state.user_brake = brake_manual
       self.simulator_state.user_gas = throttle_manual
+      self.simulator_state.user_torque = steer_manual * -10000
 
       steer_manual = steer_manual * -40
 
       # Update openpilot on current sensor state
       self.simulated_sensors.update(self.simulator_state, self.world)
 
-      is_openpilot_engaged = self.simulated_car.sm['controlsState'].active
-
       self.simulated_car.sm.update(0)
+      controlsState = self.simulated_car.sm['controlsState']
+      self.simulator_state.is_engaged = controlsState.active
 
-      if is_openpilot_engaged:
+      if self.simulator_state.is_engaged:
         throttle_op = clip(self.simulated_car.sm['carControl'].actuators.accel / 1.6, 0.0, 1.0)
         brake_op = clip(-self.simulated_car.sm['carControl'].actuators.accel / 4.0, 0.0, 1.0)
         steer_op = self.simulated_car.sm['carControl'].actuators.steeringAngleDeg
 
-      throttle_out = throttle_op if is_openpilot_engaged else throttle_manual
-      brake_out = brake_op if is_openpilot_engaged else brake_manual
-      steer_out = steer_op if is_openpilot_engaged else steer_manual
+        self.past_startup_engaged = True
+      elif not self.past_startup_engaged and controlsState.engageable:
+        self.simulator_state.cruise_button = CruiseButtons.DECEL_SET # force engagement on startup
+
+      throttle_out = throttle_op if self.simulator_state.is_engaged else throttle_manual
+      brake_out = brake_op if self.simulator_state.is_engaged else brake_manual
+      steer_out = steer_op if self.simulator_state.is_engaged else steer_manual
 
       self.world.apply_controls(steer_out, throttle_out, brake_out)
       self.world.read_sensors(self.simulator_state)
@@ -148,6 +177,9 @@ class SimulatorBridge(ABC):
       if self.rk.frame % self.TICKS_PER_FRAME == 0:
         self.world.tick()
         self.world.read_cameras()
+
+      if self.rk.frame % 25 == 0:
+        self.print_status()
 
       self.started = True
 
